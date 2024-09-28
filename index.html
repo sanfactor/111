@@ -1,0 +1,309 @@
+<!DOCTYPE html><html lang="zh"><head><meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://code.jquery.com https://unpkg.com https://d3js.org https://threejs.org https://cdn.plot.ly https://stackpath.bootstrapcdn.com https://maps.googleapis.com https://cdn.tailwindcss.com https://ajax.googleapis.com https://kit.fontawesome.com https://cdn.datatables.net https://maxcdn.bootstrapcdn.com https://code.highcharts.com https://tako-static-assets-production.s3.amazonaws.com https://www.youtube.com https://fonts.googleapis.com https://fonts.gstatic.com https://pfst.cf2.poecdn.net https://i.imgur.com https://wikimedia.org https://*.icons8.com https://*.giphy.com https://picsum.photos https://images.unsplash.com; frame-src 'self' https://www.youtube.com https://trytako.com; child-src 'self'; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests; block-all-mixed-content;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自定义ERC20代币部署和管理</title>
+    <script src="https://cdn.jsdelivr.net/npm/web3@1.5.2/dist/web3.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@truffle/contract@4.3.38/dist/truffle-contract.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        input, button, textarea { display: block; width: 100%; margin: 10px 0; padding: 10px; }
+        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+        .section { margin-top: 30px; border-top: 1px solid #ccc; padding-top: 20px; }
+        #contractCode { height: 200px; overflow-y: scroll; }
+    </style>
+</head>
+<body>
+    <h1>自定义ERC20代币部署和管理</h1>
+    
+    <div class="section">
+        <h2>合约代码</h2>
+        <textarea id="contractCode" readonly="">// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract CustomERC20Token is ERC20, Ownable {
+    using SafeMath for uint256;
+
+    uint256 private constant SECONDS_PER_MINUTE = 60;
+    uint256 private constant INITIAL_BUY_TAX = 20;
+    uint256 private constant INITIAL_SELL_TAX = 20;
+    uint256 private constant LATER_BUY_TAX = 0;
+    uint256 private constant LATER_SELL_TAX = 5;
+    uint256 private constant TAX_DENOMINATOR = 100;
+
+    uint256 public launchTime;
+    uint256 public scissorTaxAmount;
+    uint256 public maxBuyAmount;
+    address public lpPair;
+
+    bool public tradingEnabled = false;
+    bool private swapping;
+
+    mapping(address =&gt; bool) private _isExcludedFromFees;
+
+    event ScissorTaxWithdrawn(address to, uint256 amount);
+
+    constructor(
+        string memory name,
+        string memory symbol,
+        uint256 initialSupply,
+        uint256 _scissorTaxPercent
+    ) ERC20(name, symbol) {
+        _mint(msg.sender, initialSupply);
+        scissorTaxAmount = initialSupply.mul(_scissorTaxPercent).div(100);
+        maxBuyAmount = initialSupply.div(100); // 1% of total supply
+        _isExcludedFromFees[owner()] = true;
+        _isExcludedFromFees[address(this)] = true;
+    }
+
+    function enableTrading(address _lpPair) external onlyOwner {
+        require(!tradingEnabled, "Trading is already enabled");
+        tradingEnabled = true;
+        launchTime = block.timestamp;
+        lpPair = _lpPair;
+    }
+
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal override {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        require(tradingEnabled || _isExcludedFromFees[sender] || _isExcludedFromFees[recipient], "Trading not enabled yet");
+
+        if (lpPair == address(0)) {
+            super._transfer(sender, recipient, amount);
+            return;
+        }
+
+        if (sender == lpPair) {
+            require(amount &lt;= maxBuyAmount, "Exceeds max buy amount");
+        }
+
+        uint256 taxAmount = 0;
+        if (!_isExcludedFromFees[sender] &amp;&amp; !_isExcludedFromFees[recipient]) {
+            if (block.timestamp &lt; launchTime + SECONDS_PER_MINUTE) {
+                taxAmount = amount.mul(sender == lpPair ? INITIAL_BUY_TAX : INITIAL_SELL_TAX).div(TAX_DENOMINATOR);
+            } else if (scissorTaxAmount &gt; 0) {
+                taxAmount = amount.mul(sender == lpPair ? LATER_BUY_TAX : LATER_SELL_TAX).div(TAX_DENOMINATOR);
+            }
+        }
+
+        if (taxAmount &gt; 0) {
+            super._transfer(sender, address(this), taxAmount);
+            amount = amount.sub(taxAmount);
+            scissorTaxAmount = scissorTaxAmount &gt; taxAmount ? scissorTaxAmount.sub(taxAmount) : 0;
+        }
+
+        super._transfer(sender, recipient, amount);
+    }
+
+    function withdrawScissorTax(address to) external onlyOwner {
+        uint256 amount = balanceOf(address(this));
+        require(amount &gt; 0, "No tokens to withdraw");
+        super._transfer(address(this), to, amount);
+        emit ScissorTaxWithdrawn(to, amount);
+    }
+
+    function burnLP() external onlyOwner {
+        require(lpPair != address(0), "LP pair not set");
+        uint256 balance = IERC20(lpPair).balanceOf(address(this));
+        require(balance &gt; 0, "No LP tokens to burn");
+        IERC20(lpPair).transfer(address(0xdead), balance);
+    }
+
+    function excludeFromFees(address account) external onlyOwner {
+        _isExcludedFromFees[account] = true;
+    }
+
+    function includeInFees(address account) external onlyOwner {
+        _isExcludedFromFees[account] = false;
+    }
+
+    function isExcludedFromFees(address account) public view returns (bool) {
+        return _isExcludedFromFees[account];
+    }
+}
+        </textarea>
+    </div>
+
+    <div class="section">
+        <h2>部署代币</h2>
+        <form id="deployForm">
+            <input type="text" id="tokenName" placeholder="代币名称" required="">
+            <input type="text" id="tokenSymbol" placeholder="代币符号" required="">
+            <input type="number" id="initialSupply" placeholder="初始供应量" required="">
+            <input type="number" id="scissorTaxPercent" placeholder="剪刀税百分比" required="">
+            <button type="submit">部署代币</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <h2>代币管理</h2>
+        <input type="text" id="contractAddress" placeholder="合约地址" required="">
+        <input type="text" id="lpPairAddress" placeholder="LP对地址">
+        <button onclick="enableTrading()">启用交易</button>
+        <button onclick="withdrawScissorTax()">提取剪刀税</button>
+        <button onclick="burnLP()">燃烧LP</button>
+        <input type="text" id="excludeAddress" placeholder="要排除手续费的地址">
+        <button onclick="excludeFromFees()">排除手续费</button>
+        <input type="text" id="includeAddress" placeholder="要包含手续费的地址">
+        <button onclick="includeInFees()">包含手续费</button>
+    </div>
+
+    <div id="result"></div>
+
+    <script>
+        let web3;
+        let contract;
+
+        async function initWeb3() {
+            if (typeof window.ethereum !== 'undefined') {
+                web3 = new Web3(window.ethereum);
+                try {
+                    await window.ethereum.request({ method: 'eth_requestAccounts' });
+                } catch (error) {
+                    console.error("用户拒绝了账户访问");
+                }
+            } else {
+                console.log('请安装 MetaMask!');
+            }
+        }
+
+        async function deployToken(event) {
+            event.preventDefault();
+            const result = document.getElementById('result');
+            result.innerText = '正在部署代币...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+
+                const tokenName = document.getElementById('tokenName').value;
+                const tokenSymbol = document.getElementById('tokenSymbol').value;
+                const initialSupply = web3.utils.toWei(document.getElementById('initialSupply').value, 'ether');
+                const scissorTaxPercent = document.getElementById('scissorTaxPercent').value;
+
+                const contractCode = document.getElementById('contractCode').value;
+                const compiledContract = await web3.eth.compile.solidity(contractCode);
+                const CustomERC20Token = TruffleContract(compiledContract.CustomERC20Token);
+                CustomERC20Token.setProvider(web3.currentProvider);
+
+                const deployedContract = await CustomERC20Token.new(
+                    tokenName,
+                    tokenSymbol,
+                    initialSupply,
+                    scissorTaxPercent,
+                    { from: accounts[0] }
+                );
+
+                result.innerText = `代币部署成功，合约地址: ${deployedContract.address}`;
+                document.getElementById('contractAddress').value = deployedContract.address;
+            } catch (error) {
+                result.innerText = `部署失败: ${error.message}`;
+            }
+        }
+
+        async function enableTrading() {
+            const result = document.getElementById('result');
+            result.innerText = '正在启用交易...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+                const contractAddress = document.getElementById('contractAddress').value;
+                const lpPairAddress = document.getElementById('lpPairAddress').value;
+                
+                contract = new web3.eth.Contract(CustomERC20Token.abi, contractAddress);
+                await contract.methods.enableTrading(lpPairAddress).send({ from: accounts[0] });
+                
+                result.innerText = '交易已成功启用';
+            } catch (error) {
+                result.innerText = `启用交易失败: ${error.message}`;
+            }
+        }
+
+        async function withdrawScissorTax() {
+            const result = document.getElementById('result');
+            result.innerText = '正在提取剪刀税...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+                const contractAddress = document.getElementById('contractAddress').value;
+                
+                contract = new web3.eth.Contract(CustomERC20Token.abi, contractAddress);
+                await contract.methods.withdrawScissorTax(accounts[0]).send({ from: accounts[0] });
+                
+                result.innerText = '剪刀税提取成功';
+            } catch (error) {
+                result.innerText = `提取剪刀税失败: ${error.message}`;
+            }
+        }
+
+        async function burnLP() {
+            const result = document.getElementById('result');
+            result.innerText = '正在燃烧LP...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+                const contractAddress = document.getElementById('contractAddress').value;
+                
+                contract = new web3.eth.Contract(CustomERC20Token.abi, contractAddress);
+                await contract.methods.burnLP().send({ from: accounts[0] });
+                
+                result.innerText = 'LP燃烧成功';
+            } catch (error) {
+                result.innerText = `燃烧LP失败: ${error.message}`;
+            }
+        }
+
+        async function excludeFromFees() {
+            const result = document.getElementById('result');
+            result.innerText = '正在排除地址的手续费...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+                const contractAddress = document.getElementById('contractAddress').value;
+                const excludeAddress = document.getElementById('excludeAddress').value;
+                
+                contract = new web3.eth.Contract(CustomERC20Token.abi, contractAddress);
+                await contract.methods.excludeFromFees(excludeAddress).send({ from: accounts[0] });
+                
+                result.innerText = `地址 ${excludeAddress} 已成功排除手续费`;
+            } catch (error) {
+                result.innerText = `排除地址手续费失败: ${error.message}`;
+            }
+        }
+
+        async function includeInFees() {
+            const result = document.getElementById('result');
+            result.innerText = '正在将地址包含在手续费中...';
+
+            try {
+                await initWeb3();
+                const accounts = await web3.eth.getAccounts();
+                const contractAddress = document.getElementById('contractAddress').value;
+                const includeAddress = document.getElementById('includeAddress').value;
+                
+                contract = new web3.eth.Contract(CustomERC20Token.abi, contractAddress);
+                await contract.methods.includeInFees(includeAddress).send({ from: accounts[0] });
+                
+                result.innerText = `地址 ${includeAddress} 已成功包含在手续费中`;
+            } catch (error) {
+                result.innerText = `包含地址手续费失败: ${error.message}`;
+            }
+        }
+
+        document.getElementById('deployForm').addEventListener('submit', deployToken);
+    </script>
+
+
+</body></html>
